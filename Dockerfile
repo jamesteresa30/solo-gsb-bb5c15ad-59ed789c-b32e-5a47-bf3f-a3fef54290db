@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY tests ./tests
 
+# 构建期运行全部单元测试（含 /fit 求解与 HTTP 接口测试），
+# 任一失败即中止构建，保证一键启动的镜像自带可用性验证。
+RUN python -m unittest discover -s tests
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
