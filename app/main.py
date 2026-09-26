@@ -11,7 +11,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from .audit import AuditValidationError, audit
-from .schemas import AuditRequest, AuditResponse
+from .fit import fit
+from .schemas import AuditRequest, AuditResponse, FitRequest, FitResponse
 
 app = FastAPI(
     title="年代约束审计 API",
@@ -19,8 +20,10 @@ app = FastAPI(
         "提交地层及其允许的整数年代区间（单位百万年，越大越古老）与 "
         "“甲比乙古老”的观测关系；服务检测关系环、传播可行年代区间，"
         "并在可行时返回古老到年轻的字典序最小合法顺序。"
+        "POST /fit 进一步在各层期望年代与权重下，选取使最大加权偏差 "
+        "max(weight × |age − target_ma|) 最小的整数年代。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -56,3 +59,21 @@ def audit_endpoint(payload: AuditRequest) -> dict:
     * ``feasible``：约束可行，附收紧区间与字典序最小合法顺序。
     """
     return audit(payload.model_dump())
+
+
+@app.post(
+    "/fit",
+    response_model=FitResponse,
+    summary="在审计约束下优选整数年代",
+    tags=["fit"],
+)
+def fit_endpoint(payload: FitRequest) -> dict:
+    """在各层期望年代与权重下选择整数年代，最小化最大加权偏差。
+
+    返回三种结果之一（由 ``status`` 字段区分）：
+
+    * ``cycle`` / ``conflict``：原约束无解，与 /audit 相同；
+    * ``optimal``：附最优值 ``optimal_value`` 与年代映射 ``ages``；
+      多解时取按编号升序排列的年代向量中字典序最小者。
+    """
+    return fit(payload.model_dump())

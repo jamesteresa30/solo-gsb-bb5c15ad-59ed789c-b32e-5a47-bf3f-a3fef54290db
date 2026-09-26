@@ -3,7 +3,9 @@ services:
     build: .
     image: age-audit-api:latest
     container_name: age-audit-api
+    # 一条命令完成构建、依赖安装与启动：docker compose up --build
     # 宿主机端口通过 HOST_PORT 配置（默认 8000）；容器内固定 8000。
+    # 启动后可用接口：POST /audit、POST /fit、GET /health、GET /docs。
     ports:
       - "${HOST_PORT:-8000}:8000"
     environment:

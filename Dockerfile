@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY tests ./tests
 
+# 构建期冒烟检查：依赖与应用可正常初始化（导入即完成路由注册）。
+RUN python -c "import app.main"
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

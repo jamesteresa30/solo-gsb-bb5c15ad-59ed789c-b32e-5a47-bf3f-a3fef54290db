@@ -22,6 +22,9 @@
 4. 若某层出现 ``L > U``，区间被压空，返回冲突地层；否则返回收紧后的
    区间，以及古老 -> 年轻方向上编号字典序最小的合法顺序
    （Kahn 算法配合最小堆）。
+
+:func:`_validate_and_build`、:func:`_topological_order` 与
+:func:`_propagate` 同时供 ``app.fit``（POST /fit）复用。
 """
 
 from __future__ import annotations
@@ -45,7 +48,55 @@ def audit(data: dict[str, Any]) -> dict[str, Any]:
     raw_strata: list[dict[str, Any]] = list(data.get("strata") or [])
     raw_relations: list[dict[str, Any]] = list(data.get("relations") or [])
 
-    # ---- 1. 基本校验（尽量一次性收集全部错误） -------------------------
+    # ---- 1. 基本校验并建图 ---------------------------------------------
+    ids, bounds, adjacency = _validate_and_build(raw_strata, raw_relations)
+
+    # ---- 2. 成环检测（迭代 DFS，输出首尾相同的环路径） -----------------
+    cycle = _find_cycle(ids, adjacency)
+    if cycle is not None:
+        return {"status": "cycle", "cycle_path": cycle}
+
+    # ---- 3. 字典序最小拓扑序 + 双向传播收紧上下界 ----------------------
+    topo = _topological_order(ids, adjacency)
+    lower, upper = _propagate(
+        ids,
+        adjacency,
+        topo,
+        {sid: bounds[sid][0] for sid in ids},
+        {sid: bounds[sid][1] for sid in ids},
+    )
+
+    tight_intervals = {
+        sid: {"youngest_ma": lower[sid], "oldest_ma": upper[sid]} for sid in ids
+    }
+
+    # ---- 4. 区间是否被压空 ---------------------------------------------
+    conflicts = sorted(sid for sid in ids if lower[sid] > upper[sid])
+    if conflicts:
+        return {
+            "status": "conflict",
+            "conflicting_strata": conflicts,
+            "tight_intervals": tight_intervals,
+        }
+
+    return {
+        "status": "feasible",
+        "tight_intervals": tight_intervals,
+        "oldest_to_youngest": topo,
+    }
+
+
+def _validate_and_build(
+    raw_strata: list[dict[str, Any]],
+    raw_relations: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, tuple[int, int]], dict[str, set[str]]]:
+    """基本校验并建图（/audit 与 /fit 共用）。
+
+    返回 ``(ids, bounds, adjacency)``：去重后的编号列表（提交顺序）、
+    各层 ``(youngest_ma, oldest_ma)`` 区间、去重后的邻接表
+    （older -> younger）。校验失败抛 :class:`AuditValidationError`，
+    尽量一次性收集全部错误。
+    """
     errors: list[str] = []
 
     ids: list[str] = []
@@ -102,19 +153,24 @@ def audit(data: dict[str, Any]) -> dict[str, Any]:
         raise AuditValidationError(errors)
 
     adjacency: dict[str, set[str]] = {sid: set() for sid in ids}
-    indegree: dict[str, int] = {sid: 0 for sid in ids}
     for older, younger in edge_set:
-        if younger not in adjacency[older]:
-            adjacency[older].add(younger)
-            indegree[younger] += 1
+        adjacency[older].add(younger)
 
-    # ---- 2. 成环检测（迭代 DFS，输出首尾相同的环路径） -----------------
-    cycle = _find_cycle(ids, adjacency)
-    if cycle is not None:
-        return {"status": "cycle", "cycle_path": cycle}
+    return ids, bounds, adjacency
 
-    # ---- 3a. 字典序最小拓扑序，同时正向收紧最晚（上）界 ----------------
-    upper = {sid: bounds[sid][1] for sid in ids}
+
+def _topological_order(
+    ids: list[str], adjacency: dict[str, set[str]]
+) -> list[str]:
+    """Kahn 算法 + 最小堆：字典序最小的拓扑序（古老 -> 年轻）。
+
+    调用前需确认无环（如先经 :func:`_find_cycle` 检查）。
+    """
+    indegree: dict[str, int] = {sid: 0 for sid in ids}
+    for u in ids:
+        for v in adjacency[u]:
+            indegree[v] += 1
+
     heap = [sid for sid in ids if indegree[sid] == 0]
     heap.sort()  # 本身即堆序
     topo: list[str] = []
@@ -122,20 +178,39 @@ def audit(data: dict[str, Any]) -> dict[str, Any]:
         u = heappop(heap)
         topo.append(u)
         for v in sorted(adjacency[u]):
-            # age(u) >= age(v) + 1  =>  U(v) <= U(u) - 1
-            candidate = upper[u] - 1
-            if candidate < upper[v]:
-                upper[v] = candidate
             indegree[v] -= 1
             if indegree[v] == 0:
                 heappush(heap, v)
 
-    # DFS 已确认无环，所有节点都应得到排列。
+    # 调用方已确认无环，所有节点都应得到排列。
     if len(topo) != len(ids):  # pragma: no cover - 防御性分支
         raise RuntimeError("拓扑排序失败：关系图中仍存在环")
+    return topo
 
-    # ---- 3b. 反向收紧最早（下）界 --------------------------------------
-    lower = {sid: bounds[sid][0] for sid in ids}
+
+def _propagate(
+    ids: list[str],
+    adjacency: dict[str, set[str]],
+    topo: list[str],
+    lower0: dict[str, int],
+    upper0: dict[str, int],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """在 DAG 上沿拓扑序双向传播，返回收紧后的 ``(lower, upper)`` 新字典。
+
+    * 最晚（上）界沿拓扑正向收紧：``U(v) = min(U(v), U(u) - 1)``；
+    * 最早（下）界沿拓扑反向收紧：``L(u) = max(L(u), L(v) + 1)``。
+
+    传播结果是精确不动点：约束组可行当且仅当每层 ``L <= U``。
+    """
+    upper = dict(upper0)
+    for u in topo:
+        # age(u) >= age(v) + 1  =>  U(v) <= U(u) - 1
+        candidate = upper[u] - 1
+        for v in adjacency[u]:
+            if candidate < upper[v]:
+                upper[v] = candidate
+
+    lower = dict(lower0)
     for u in reversed(topo):
         for v in adjacency[u]:
             # age(u) >= age(v) + 1  =>  L(u) >= L(v) + 1
@@ -143,24 +218,7 @@ def audit(data: dict[str, Any]) -> dict[str, Any]:
             if candidate > lower[u]:
                 lower[u] = candidate
 
-    tight_intervals = {
-        sid: {"youngest_ma": lower[sid], "oldest_ma": upper[sid]} for sid in ids
-    }
-
-    # ---- 4. 区间是否被压空 ---------------------------------------------
-    conflicts = sorted(sid for sid in ids if lower[sid] > upper[sid])
-    if conflicts:
-        return {
-            "status": "conflict",
-            "conflicting_strata": conflicts,
-            "tight_intervals": tight_intervals,
-        }
-
-    return {
-        "status": "feasible",
-        "tight_intervals": tight_intervals,
-        "oldest_to_youngest": topo,
-    }
+    return lower, upper
 
 
 def _find_cycle(
