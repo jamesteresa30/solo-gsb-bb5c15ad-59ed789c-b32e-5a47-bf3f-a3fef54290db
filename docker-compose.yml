@@ -1,0 +1,18 @@
+services:
+  age-audit:
+    build: .
+    image: age-audit-api:latest
+    container_name: age-audit-api
+    # 宿主机端口通过 HOST_PORT 配置（默认 8000）；容器内固定 8000。
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      # 供容器内健康检查等使用；应用始终监听容器 8000 端口。
+      PORT: "8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
